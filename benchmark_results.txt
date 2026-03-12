@@ -1,0 +1,23 @@
+==============================
+Benchmark: Thu Mar 12 10:56:15 AM CET 2026
+Binary: ./build/DAM
+==============================
+Exit code:    0
+Elapsed time: 2.398s
+Peak RSS:     8.95 MB (9168 kB)
+
+Output files:
+  data/sorted: 0 files, 4.0K total
+  data/tree: 11 files, 46M total
+    data/tree/leaf_0.csv (8.7M)
+    data/tree/leaf_1.csv (8.7M)
+    data/tree/leaf_2.csv (8.6M)
+    data/tree/leaf_3.csv (8.6M)
+    data/tree/leaf_4.csv (8.6M)
+    data/tree/leaf_5.csv (2.2M)
+    data/tree/node_1_0.csv (4.0K)
+    data/tree/node_1_1.csv (4.0K)
+    data/tree/node_1_2.csv (4.0K)
+    data/tree/node_2_3.csv (4.0K)
+    data/tree/node_root.csv (4.0K)
+==============================
