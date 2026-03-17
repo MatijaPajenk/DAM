@@ -1,3 +1,4 @@
+#include "types.hpp"
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -9,27 +10,6 @@
 
 #define MAX_CHUNK_SIZE (10 * 1'024 * 1'024)
 #define MAX_MERGE_SIZE (MAX_CHUNK_SIZE / 2)
-
-struct Point {
-  double x, y, z;
-
-  static Point parse(const std::string &line) {
-    std::istringstream iss(line);
-    std::string word;
-    Point p;
-    std::getline(iss, word, ',');
-    p.x = std::stod(word);
-    std::getline(iss, word, ',');
-    p.y = std::stod(word);
-    std::getline(iss, word, ',');
-    p.z = std::stod(word);
-    return p;
-  }
-};
-
-struct Bounds {
-  double xmin, xmax, ymin, ymax;
-};
 
 void print_progress(const std::string &operation, const size_t current,
                     const size_t total) {
@@ -338,20 +318,6 @@ bool merge_chunks(const std::string &chunks_dir, const std::string &merged_dir,
   return true;
 }
 
-enum class Axis { X, Y, NONE };
-
-struct Node {
-  std::string path;
-  std::string filename;
-  double split_value = 0;
-  double xmin = 0, xmax = 0, ymin = 0, ymax = 0;
-  std::unique_ptr<Node> left;
-  std::unique_ptr<Node> right;
-  Axis axis = Axis::NONE;
-  int depth = 0;
-  bool is_leaf = false;
-};
-
 bool skip_meta(std::ifstream &f) {
   std::string line;
   while (std::getline(f, line)) {
@@ -363,40 +329,43 @@ bool skip_meta(std::ifstream &f) {
   return false;
 }
 
-static void write_meta_block(std::ofstream &out, const std::string &node_path,
-                             int depth, bool is_leaf, Axis axis,
-                             std::optional<double> split_val, double xmin,
-                             double xmax, double ymin, double ymax,
-                             const std::string &child_left,
-                             const std::string &child_right) {
+static void write_meta_block(std::ofstream &out, const NodeMeta &meta) {
   out << std::fixed << std::setprecision(13);
   out << "# META BEGIN\n";
-  out << "# path        " << node_path << "\n";
-  out << "# depth       " << depth << "\n";
-  out << "# is_leaf     " << (is_leaf ? 1 : 0) << "\n";
+  out << "# path        " << meta.node_path << "\n";
+  out << "# depth       " << meta.depth << "\n";
+  out << "# is_leaf     " << (meta.is_leaf ? 1 : 0) << "\n";
   out << "# split_axis  "
-      << (axis == Axis::X   ? "x"
-          : axis == Axis::Y ? "y"
-                            : "none")
+      << (meta.axis == Axis::X   ? "x"
+          : meta.axis == Axis::Y ? "y"
+                                 : "none")
       << "\n";
-  out << "# split_value " << (split_val ? std::to_string(*split_val) : "none")
-      << '\n';
-  out << "# xmin        " << xmin << "\n";
-  out << "# xmax        " << xmax << "\n";
-  out << "# ymin        " << ymin << "\n";
-  out << "# ymax        " << ymax << "\n";
-  out << "# child_left  " << (child_left.empty() ? "none" : child_left) << "\n";
-  out << "# child_right " << (child_right.empty() ? "none" : child_right)
-      << "\n";
+
+  out << "# split_value ";
+  if (meta.split_value) {
+    out << *meta.split_value;
+  } else {
+    out << "none";
+  }
+  out << '\n';
+
+  out << "# xmin        " << meta.bounds.xmin << "\n";
+  out << "# xmax        " << meta.bounds.xmax << "\n";
+  out << "# ymin        " << meta.bounds.ymin << "\n";
+  out << "# ymax        " << meta.bounds.ymax << "\n";
+  out << "# child_left  "
+      << (meta.children.left.empty() ? "none" : meta.children.left) << "\n";
+  out << "# child_right "
+      << (meta.children.right.empty() ? "none" : meta.children.right) << "\n";
   out << "# META END\n";
-  if (is_leaf)
+
+  if (meta.is_leaf) {
     out << "x,y,z\n";
+  }
 }
 
-static bool preprend_meta_to_leaf(const std::string &filepath,
-                                  const std::string &node_path, int depth,
-                                  double xmin, double xmax, double ymin,
-                                  double ymax) {
+static bool prepend_meta_to_leaf(const std::string &filepath,
+                                 const NodeMeta &meta) {
   std::ifstream in(filepath);
   if (!in.is_open()) {
     std::cout << "Failed to open in file!\n";
@@ -416,8 +385,7 @@ static bool preprend_meta_to_leaf(const std::string &filepath,
     return false;
   }
 
-  write_meta_block(out, node_path, depth, true, Axis::NONE, std::nullopt, xmin,
-                   xmax, ymin, ymax, "", "");
+  write_meta_block(out, meta);
 
   std::string line;
   while (std::getline(in, line)) {
@@ -433,28 +401,21 @@ static bool preprend_meta_to_leaf(const std::string &filepath,
 }
 
 static bool write_internal_node_leaf_file(const std::string &filepath,
-                                          const std::string &node_path,
-                                          int depth, Axis axis,
-                                          double split_value, double xmin,
-                                          double xmax, double ymin, double ymax,
-                                          const std::string &child_left,
-                                          const std::string &child_right) {
+                                          const NodeMeta &meta) {
   std::ofstream f(filepath);
   if (!f.is_open()) {
     std::cout << "Failed to open file!\n";
     return false;
   }
-  write_meta_block(f, node_path, depth, false, axis, split_value, xmin, xmax,
-                   ymin, ymax, child_left, child_right);
+  write_meta_block(f, meta);
   return true;
 }
 
-static bool scan_bounds(const std::string &filepath, double &xmin, double &xmax,
-                        double &ymin, double &ymax) {
+static std::optional<Bounds> scan_bounds(const std::string &filepath) {
   std::ifstream f(filepath);
   if (!f.is_open()) {
     std::cout << "Failed to open file!\n";
-    return false;
+    return std::nullopt;
   }
 
   std::string first;
@@ -464,6 +425,7 @@ static bool scan_bounds(const std::string &filepath, double &xmin, double &xmax,
   }
 
   bool any = false;
+  Bounds b{};
   std::string line;
   while (std::getline(f, line)) {
     if (line.empty()) {
@@ -472,19 +434,21 @@ static bool scan_bounds(const std::string &filepath, double &xmin, double &xmax,
 
     const Point p = Point::parse(line);
     if (!any) {
-      xmin = xmax = p.x;
-      ymin = ymax = p.y;
+      b.xmin = b.xmax = p.x;
+      b.ymin = b.ymax = p.y;
       any = true;
     } else {
-      if (p.x > xmax) {
-        xmax = p.x;
-      }
-      if (p.y > ymax) {
-        ymax = p.y;
-      }
+      b.xmin = std::min(b.xmin, p.x);
+      b.xmax = std::max(b.xmax, p.x);
+      b.ymin = std::min(b.ymin, p.y);
+      b.ymax = std::max(b.ymax, p.y);
     }
   }
-  return any;
+
+  if (!any) {
+    return std::nullopt;
+  }
+  return b;
 }
 
 bool build_tree_from_chunks(const std::vector<std::string> &leaf_files,
@@ -503,8 +467,8 @@ bool build_tree_from_chunks(const std::vector<std::string> &leaf_files,
   level.reserve(n);
 
   for (size_t i = 0; i < n; ++i) {
-    double xmin, xmax, ymin, ymax;
-    if (!scan_bounds(leaf_files[i], xmin, xmax, ymin, ymax)) {
+    const auto bounds_opt = scan_bounds(leaf_files[i]);
+    if (!bounds_opt) {
       std::cout << "Warning: skiping empty/unreadable file" << leaf_files[i]
                 << "\n";
       continue;
@@ -521,16 +485,25 @@ bool build_tree_from_chunks(const std::vector<std::string> &leaf_files,
 
     std::string leaf_name = "leaf_" + std::to_string(i);
 
-    preprend_meta_to_leaf(leaf_path, leaf_name, 0, xmin, xmax, ymin, ymax);
+    NodeMeta leaf_meta;
+    leaf_meta.node_path = leaf_name;
+    leaf_meta.depth = 0;
+    leaf_meta.is_leaf = true;
+    leaf_meta.axis = Axis::NONE;
+    leaf_meta.split_value = std::nullopt;
+    leaf_meta.bounds = *bounds_opt;
+    leaf_meta.children = {"", ""};
+
+    prepend_meta_to_leaf(leaf_path, leaf_meta);
 
     auto node = std::make_unique<Node>();
     node->path = leaf_name;
     node->filename = leaf_path;
     node->is_leaf = true;
-    node->xmin = xmin;
-    node->xmax = xmax;
-    node->ymin = ymin;
-    node->ymax = ymax;
+    node->xmin = bounds_opt->xmin;
+    node->xmax = bounds_opt->xmax;
+    node->ymin = bounds_opt->ymin;
+    node->ymax = bounds_opt->ymax;
 
     level.push_back(std::move(node));
     print_progress("Scanning", i + 1, n);
@@ -581,9 +554,16 @@ bool build_tree_from_chunks(const std::vector<std::string> &leaf_files,
       const std::string right_base =
           std::filesystem::path(R->filename).filename().string();
 
-      write_internal_node_leaf_file(node_file, node_path_str, 0, axis,
-                                    split_val, xmin, xmax, ymin, ymax,
-                                    left_base, right_base);
+      NodeMeta internal_meta;
+      internal_meta.node_path = node_path_str;
+      internal_meta.depth = 0;
+      internal_meta.is_leaf = false;
+      internal_meta.axis = axis;
+      internal_meta.split_value = split_val;
+      internal_meta.bounds = Bounds{xmin, xmax, ymin, ymax};
+      internal_meta.children = {left_base, right_base};
+
+      write_internal_node_leaf_file(node_file, internal_meta);
 
       auto parent = std::make_unique<Node>();
       parent->path = node_path_str;
@@ -625,13 +605,28 @@ bool build_tree_from_chunks(const std::vector<std::string> &leaf_files,
             : "";
 
     if (node->is_leaf) {
-      preprend_meta_to_leaf(node->filename, node->path, depth, node->xmin,
-                            node->xmax, node->ymin, node->ymax);
+      NodeMeta leaf_meta;
+      leaf_meta.node_path = node->path;
+      leaf_meta.depth = depth;
+      leaf_meta.is_leaf = true;
+      leaf_meta.axis = Axis::NONE;
+      leaf_meta.split_value = std::nullopt;
+      leaf_meta.bounds = Bounds{node->xmin, node->xmax, node->ymin, node->ymax};
+      leaf_meta.children = {"", ""};
+
+      prepend_meta_to_leaf(node->filename, leaf_meta);
     } else {
-      write_internal_node_leaf_file(node->filename, node->path, depth,
-                                    node->axis, node->split_value, node->xmin,
-                                    node->xmax, node->ymin, node->ymax,
-                                    left_base, right_base);
+      NodeMeta internal_meta;
+      internal_meta.node_path = node->path;
+      internal_meta.depth = depth;
+      internal_meta.is_leaf = false;
+      internal_meta.axis = node->axis;
+      internal_meta.split_value = node->split_value;
+      internal_meta.bounds =
+          Bounds{node->xmin, node->xmax, node->ymin, node->ymax};
+      internal_meta.children = {left_base, right_base};
+
+      write_internal_node_leaf_file(node->filename, internal_meta);
     }
 
     fix_depth(node->left.get(), depth + 1);
@@ -645,15 +640,22 @@ bool build_tree_from_chunks(const std::vector<std::string> &leaf_files,
   std::filesystem::rename(root->filename, root_dest);
   root->filename = root_dest;
 
-  write_internal_node_leaf_file(
-      root->filename, "node_root", root->depth, root->axis, root->split_value,
-      root->xmin, root->xmax, root->ymin, root->ymax,
+  NodeMeta root_meta;
+  root_meta.node_path = "node_root";
+  root_meta.depth = root->depth;
+  root_meta.is_leaf = false;
+  root_meta.axis = root->axis;
+  root_meta.split_value = root->split_value;
+  root_meta.bounds = Bounds{root->xmin, root->xmax, root->ymin, root->ymax};
+  root_meta.children = {
       root->left
           ? std::filesystem::path(root->left->filename).filename().string()
           : "",
       root->right
           ? std::filesystem::path(root->right->filename).filename().string()
-          : "");
+          : ""};
+
+  write_internal_node_leaf_file(root->filename, root_meta);
 
   std::cout << "Tree built successfully. Root: " << root_dest << '\n';
   return true;
@@ -813,7 +815,7 @@ int main(int argc, char **argv) {
 
     std::filesystem::remove_all("data/sorted");
 
-  } else if ("-q") {
+  } else if (option == "-q") {
     auto root = load_tree_index(input_file);
 
     Bounds bounds;
@@ -821,6 +823,8 @@ int main(int argc, char **argv) {
     bounds.xmax = std::stod(argv[4]);
     bounds.ymin = std::stod(argv[5]);
     bounds.ymax = std::stod(argv[6]);
+
+    std::cout << std::fixed << std::setprecision(13);
 
     std::cout << "Bounds: " << bounds.xmin << ", " << bounds.xmax << ", "
               << bounds.ymin << ", " << bounds.ymax << "\n";
